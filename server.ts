@@ -77,8 +77,29 @@ export async function createApp() {
 
   app.use(express.json({ limit: '25mb' }));
 
-  // Initialize the Postgres-backed portfolio data cache.
+  // Working copy of the portfolio data; reloaded from the database on every API request (see below).
   let portfolioData: PortfolioData = await initStore();
+
+  // Always work on fresh data. Serverless hosts (Vercel) run several instances, each with its own
+  // memory, so a copy cached at start-up goes stale as soon as another instance saves a change.
+  // Requests are queued one at a time per instance so a read-modify-save cycle cannot interleave.
+  let requestQueue: Promise<void> = Promise.resolve();
+  app.use('/api', async (req, res, next) => {
+    if (req.path === '/health' || req.path.startsWith('/media/')) return next();
+    res.setHeader('Cache-Control', 'no-store');
+    const previous = requestQueue;
+    let release: () => void = () => {};
+    requestQueue = new Promise<void>((resolve) => { release = resolve; });
+    res.on('close', release);
+    try {
+      await previous;
+      portfolioData = await initStore();
+      next();
+    } catch (error) {
+      console.error('Could not load portfolio data:', error);
+      res.status(503).json({ error: 'Database is not reachable. Please try again.' });
+    }
+  });
 
   // Helper auth check for Admin API routes
   const requireAdminAuth = async (req: express.Request, res: express.Response, next: express.NextFunction) => {

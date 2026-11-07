@@ -3,8 +3,6 @@ import crypto from 'crypto';
 import pg from 'pg';
 import { PortfolioData } from '../src/types.js';
 import { initialPortfolioData } from './initialData.js';
-import net from 'net';
-net.setDefaultAutoSelectFamilyAttemptTimeout(5000);
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -26,17 +24,43 @@ function withoutLegacyPassword(data: PortfolioData): PortfolioData {
   return { ...data, profile };
 }
 
+// Older databases created portfolio_media without a file name column; add it once per instance.
+let mediaSchemaReady: Promise<unknown> | null = null;
+function ensureMediaSchema() {
+  mediaSchemaReady ??= pool
+    .query('alter table portfolio_media add column if not exists file_name text')
+    .catch((error) => {
+      mediaSchemaReady = null;
+      throw error;
+    });
+  return mediaSchemaReady;
+}
+
 export async function initStore(): Promise<PortfolioData> {
+  await ensureMediaSchema();
   const { rows } = await pool.query('select data from portfolio_state where id = $1', ['primary']);
   if (!rows[0]) throw new Error('No portfolio data found. Run `npm run db:seed` first.');
-  return withoutLegacyPassword(rows[0].data as PortfolioData);
+  // The media library is read from the portfolio_media table itself, so uploads can never be lost
+  // by a concurrent save of the portfolio document.
+  const media = await pool.query(
+    'select id, file_name, content_type, created_at from portfolio_media order by created_at desc'
+  );
+  const data = withoutLegacyPassword(rows[0].data as PortfolioData);
+  data.mediaAssets = media.rows.map((row) => ({
+    id: row.id,
+    fileName: row.file_name || row.id,
+    fileUrl: `/api/media/${row.id}`,
+    fileType: row.content_type,
+    uploadedAt: new Date(row.created_at).toISOString()
+  }));
+  return data;
 }
 
 export async function saveStore(data: PortfolioData): Promise<void> {
   await pool.query(
     `insert into portfolio_state (id, data, updated_at) values ('primary', $1, now())
      on conflict (id) do update set data = excluded.data, updated_at = now()`,
-    [JSON.stringify(withoutLegacyPassword(data))]
+    [JSON.stringify({ ...withoutLegacyPassword(data), mediaAssets: [] })]
   );
 }
 
@@ -78,8 +102,10 @@ export async function uploadMedia(fileName: string, fileUrl: string, fileType: s
   if (!match) throw new Error('Invalid media upload format.');
 
   const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  await pool.query('insert into portfolio_media (id, content_type, data) values ($1, $2, $3)', [
+  await ensureMediaSchema();
+  await pool.query('insert into portfolio_media (id, file_name, content_type, data) values ($1, $2, $3, $4)', [
     id,
+    fileName,
     fileType || match[1],
     Buffer.from(match[2], 'base64')
   ]);
